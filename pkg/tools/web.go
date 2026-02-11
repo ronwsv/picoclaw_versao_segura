@@ -60,7 +60,7 @@ func (t *WebSearchTool) Parameters() map[string]interface{} {
 
 func (t *WebSearchTool) Execute(ctx context.Context, args map[string]interface{}) (string, error) {
 	if t.apiKey == "" {
-		return "Error: BRAVE_API_KEY not configured", nil
+		return "Error: Web search API key not configured", nil
 	}
 
 	query, ok := args["query"].(string)
@@ -75,6 +75,82 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]interface{}
 		}
 	}
 
+	// Try Search1API first, fall back to Brave Search
+	result, err := t.searchWithSearch1API(ctx, query, count)
+	if err != nil {
+		result, err = t.searchWithBrave(ctx, query, count)
+	}
+	return result, err
+}
+
+func (t *WebSearchTool) searchWithSearch1API(ctx context.Context, query string, count int) (string, error) {
+	reqBody := map[string]interface{}{
+		"query":       query,
+		"max_results": count,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.search1api.com/search", strings.NewReader(string(jsonData)))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+t.apiKey)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Search1API response format
+	var searchResp struct {
+		Results []struct {
+			Title   string `json:"title"`
+			Link    string `json:"link"`
+			Snippet string `json:"snippet"`
+			Content string `json:"content"`
+		} `json:"results"`
+	}
+
+	if err := json.Unmarshal(body, &searchResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if len(searchResp.Results) == 0 {
+		return fmt.Sprintf("No results for: %s", query), nil
+	}
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Results for: %s", query))
+	for i, item := range searchResp.Results {
+		if i >= count {
+			break
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s\n   %s", i+1, item.Title, item.Link))
+		if item.Snippet != "" {
+			lines = append(lines, fmt.Sprintf("   %s", item.Snippet))
+		}
+	}
+
+	return strings.Join(lines, "\n"), nil
+}
+
+func (t *WebSearchTool) searchWithBrave(ctx context.Context, query string, count int) (string, error) {
 	searchURL := fmt.Sprintf("https://api.search.brave.com/res/v1/web/search?q=%s&count=%d",
 		url.QueryEscape(query), count)
 

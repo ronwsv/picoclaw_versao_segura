@@ -1,0 +1,65 @@
+# ============================================
+# PicoClaw - Docker Compose com isolamento de seguranca
+# ============================================
+#
+# USO:
+#   1. Copie .env.example para .env e preencha sua API key
+#   2. docker compose up --build -d
+#   3. docker compose exec picoclaw picoclaw agent -m "Ola!"
+#
+# Para modo interativo:
+#   docker compose run --rm picoclaw agent
+#
+
+services:
+  picoclaw:
+    build: .
+    container_name: picoclaw-sandbox
+
+    # --- Variaveis de ambiente (API keys seguras, nunca no config.json) ---
+    env_file:
+      - .env
+
+    # --- Limites de recursos ---
+    deploy:
+      resources:
+        limits:
+          memory: 128M       # PicoClaw usa ~10MB, 128MB e mais que suficiente
+          cpus: "1.0"        # Limitar a 1 CPU
+        reservations:
+          memory: 32M
+
+    # --- Seguranca ---
+    security_opt:
+      - no-new-privileges:true  # Impede escalacao de privilegios
+
+    # Diretorios temporarios necessarios (em memoria, nao no disco)
+    tmpfs:
+      - /tmp:size=50M
+      - /sandbox:size=100M    # Area de trabalho do agente
+
+    # Volumes persistentes (apenas o necessario)
+    volumes:
+      - picoclaw-data:/home/picoclaw/.picoclaw    # Config + workspace + sessoes
+
+    # --- Rede restrita ---
+    # So permite saida para APIs, sem portas expostas
+    networks:
+      - picoclaw-net
+
+    # Modo gateway com debug: ativa canais (Telegram, Discord, etc.)
+    command: ["gateway", "--debug"]
+
+    # Manter rodando
+    stdin_open: true
+    tty: true
+
+    # Reiniciar automaticamente se falhar
+    restart: unless-stopped
+
+networks:
+  picoclaw-net:
+    driver: bridge
+
+volumes:
+  picoclaw-data:

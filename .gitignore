@@ -12,5 +12,18 @@ coverage.txt
 coverage.html
 .DS_Store
 build
+.env
+.env.*
+!.env.example
+
+# Local secrets and certificates
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.jks
+*.keystore
 
 picoclaw
