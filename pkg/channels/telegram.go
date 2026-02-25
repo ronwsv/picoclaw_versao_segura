@@ -233,13 +233,20 @@ func (c *TelegramChannel) handleMessage(update tgbotapi.Update) {
 	}
 
 	if message.Document != nil {
-		docPath := c.downloadFile(message.Document.FileID, "")
+		origName := message.Document.FileName
+		ext := filepath.Ext(origName)
+		docPath := c.downloadFile(message.Document.FileID, ext)
 		if docPath != "" {
+			// Save to workspace uploads dir for persistence
+			savedPath := c.saveToWorkspace(docPath, origName)
+			if savedPath != "" {
+				docPath = savedPath
+			}
 			mediaPaths = append(mediaPaths, docPath)
 			if content != "" {
 				content += "\n"
 			}
-			content += fmt.Sprintf("[file: %s]", docPath)
+			content += fmt.Sprintf("[file: %s] (original name: %s)", docPath, origName)
 		}
 	}
 
@@ -386,6 +393,58 @@ func (c *TelegramChannel) downloadFile(fileID, ext string) string {
 	}
 
 	return localPath
+}
+
+func (c *TelegramChannel) saveToWorkspace(tempPath, originalName string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("Failed to get home dir: %v", err)
+		return ""
+	}
+
+	uploadsDir := filepath.Join(home, ".picoclaw", "workspace", "uploads")
+	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+		log.Printf("Failed to create uploads dir: %v", err)
+		return ""
+	}
+
+	// Use original name if available, otherwise use temp file name
+	destName := filepath.Base(tempPath)
+	if originalName != "" {
+		destName = originalName
+	}
+
+	destPath := filepath.Join(uploadsDir, destName)
+
+	// Avoid overwriting: append timestamp if file exists
+	if _, err := os.Stat(destPath); err == nil {
+		ext := filepath.Ext(destName)
+		base := strings.TrimSuffix(destName, ext)
+		destName = fmt.Sprintf("%s_%d%s", base, time.Now().Unix(), ext)
+		destPath = filepath.Join(uploadsDir, destName)
+	}
+
+	src, err := os.Open(tempPath)
+	if err != nil {
+		log.Printf("Failed to open temp file: %v", err)
+		return ""
+	}
+	defer src.Close()
+
+	dst, err := os.Create(destPath)
+	if err != nil {
+		log.Printf("Failed to create workspace file: %v", err)
+		return ""
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		log.Printf("Failed to copy file to workspace: %v", err)
+		return ""
+	}
+
+	log.Printf("File saved to workspace: %s", destPath)
+	return destPath
 }
 
 func parseChatID(chatIDStr string) (int64, error) {

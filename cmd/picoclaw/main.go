@@ -551,11 +551,47 @@ func gatewayCmd() {
 		})
 
 	cronStorePath := filepath.Join(filepath.Dir(getConfigPath()), "cron", "jobs.json")
-	cronService := cron.NewCronService(cronStorePath, nil)
+	cronService := cron.NewCronService(cronStorePath, func(job *cron.CronJob) (string, error) {
+		sessionKey := fmt.Sprintf("cron:%s", job.ID)
+		channel := "cron"
+		chatID := ""
+		if job.Payload.Deliver && job.Payload.Channel != "" {
+			channel = job.Payload.Channel
+			chatID = job.Payload.To
+		}
+		msgBus.PublishInbound(bus.InboundMessage{
+			Channel:    channel,
+			SenderID:   "cron",
+			ChatID:     chatID,
+			Content:    job.Payload.Message,
+			SessionKey: sessionKey,
+			Metadata: map[string]string{
+				"cron_job_id":   job.ID,
+				"cron_job_name": job.Name,
+				"deliver":       fmt.Sprintf("%v", job.Payload.Deliver),
+			},
+		})
+		logger.InfoCF("cron", "Job triggered", map[string]interface{}{
+			"job_id":  job.ID,
+			"name":    job.Name,
+			"deliver": job.Payload.Deliver,
+			"channel": channel,
+		})
+		return "ok", nil
+	})
 
 	heartbeatService := heartbeat.NewHeartbeatService(
 		cfg.WorkspacePath(),
-		nil,
+		func(prompt string) (string, error) {
+			msgBus.PublishInbound(bus.InboundMessage{
+				Channel:    "heartbeat",
+				SenderID:   "heartbeat",
+				Content:    prompt,
+				SessionKey: "heartbeat:check",
+			})
+			logger.DebugC("heartbeat", "Heartbeat check published to message bus")
+			return "ok", nil
+		},
 		30*60,
 		true,
 	)

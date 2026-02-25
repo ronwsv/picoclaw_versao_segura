@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -52,12 +54,14 @@ type CronStore struct {
 type JobHandler func(job *CronJob) (string, error)
 
 type CronService struct {
-	storePath string
-	store     *CronStore
-	onJob     JobHandler
-	mu        sync.RWMutex
-	running   bool
-	stopChan  chan struct{}
+	storePath    string
+	store        *CronStore
+	onJob        JobHandler
+	mu           sync.RWMutex
+	running      bool
+	stopChan     chan struct{}
+	lastModTime  time.Time // track file modification time to detect external changes
+	lastFileSize int64
 }
 
 func NewCronService(storePath string, onJob JobHandler) *CronService {
@@ -85,6 +89,12 @@ func (cs *CronService) Start() error {
 	cs.recomputeNextRuns()
 	if err := cs.saveStore(); err != nil {
 		return fmt.Errorf("failed to save store: %w", err)
+	}
+
+	// Track initial file stats so we can detect external modifications
+	if info, err := os.Stat(cs.storePath); err == nil {
+		cs.lastModTime = info.ModTime()
+		cs.lastFileSize = info.Size()
 	}
 
 	cs.running = true
@@ -120,10 +130,20 @@ func (cs *CronService) runLoop() {
 }
 
 func (cs *CronService) checkJobs() {
-	cs.mu.RLock()
+	cs.mu.Lock()
 	if !cs.running {
-		cs.mu.RUnlock()
+		cs.mu.Unlock()
 		return
+	}
+
+	// Detect external changes to jobs.json (e.g. from CLI `picoclaw cron add`)
+	if info, err := os.Stat(cs.storePath); err == nil {
+		if info.ModTime() != cs.lastModTime || info.Size() != cs.lastFileSize {
+			cs.loadStore()
+			cs.recomputeNextRuns()
+			cs.lastModTime = info.ModTime()
+			cs.lastFileSize = info.Size()
+		}
 	}
 
 	now := time.Now().UnixMilli()
@@ -135,15 +155,11 @@ func (cs *CronService) checkJobs() {
 			dueJobs = append(dueJobs, job)
 		}
 	}
-	cs.mu.RUnlock()
+	cs.mu.Unlock()
 
 	for _, job := range dueJobs {
 		cs.executeJob(job)
 	}
-
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	cs.saveStore()
 }
 
 func (cs *CronService) executeJob(job *CronJob) {
@@ -197,7 +213,135 @@ func (cs *CronService) computeNextRun(schedule *CronSchedule, nowMS int64) *int6
 		return &next
 	}
 
+	if schedule.Kind == "cron" && schedule.Expr != "" {
+		now := time.UnixMilli(nowMS)
+		loc := time.Local
+		if schedule.TZ != "" {
+			if l, err := time.LoadLocation(schedule.TZ); err == nil {
+				loc = l
+			}
+		}
+		now = now.In(loc)
+		next := nextCronTime(schedule.Expr, now)
+		if next != nil {
+			ms := next.UnixMilli()
+			return &ms
+		}
+	}
+
 	return nil
+}
+
+// nextCronTime calculates the next time a cron expression should fire after 'after'.
+// Supports standard 5-field cron: minute hour day-of-month month day-of-week
+// Fields support: numbers, *, */N, ranges (1-5), lists (1,3,5)
+func nextCronTime(expr string, after time.Time) *time.Time {
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return nil
+	}
+
+	minuteSet := parseCronField(fields[0], 0, 59)
+	hourSet := parseCronField(fields[1], 0, 23)
+	domSet := parseCronField(fields[2], 1, 31)
+	monthSet := parseCronField(fields[3], 1, 12)
+	dowSet := parseCronField(fields[4], 0, 6)
+
+	if minuteSet == nil || hourSet == nil || domSet == nil || monthSet == nil || dowSet == nil {
+		return nil
+	}
+
+	// Start from the next minute
+	t := after.Truncate(time.Minute).Add(time.Minute)
+
+	// Search up to 366 days ahead
+	limit := after.Add(366 * 24 * time.Hour)
+	for t.Before(limit) {
+		if monthSet[int(t.Month())] &&
+			domSet[t.Day()] &&
+			dowSet[int(t.Weekday())] &&
+			hourSet[t.Hour()] &&
+			minuteSet[t.Minute()] {
+			return &t
+		}
+
+		// Advance smartly: skip to next valid month/day/hour/minute
+		if !monthSet[int(t.Month())] {
+			// Jump to first day of next month
+			t = time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, t.Location())
+			continue
+		}
+		if !domSet[t.Day()] || !dowSet[int(t.Weekday())] {
+			// Jump to next day
+			t = time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, t.Location())
+			continue
+		}
+		if !hourSet[t.Hour()] {
+			// Jump to next hour
+			t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour()+1, 0, 0, 0, t.Location())
+			continue
+		}
+		// Advance by one minute
+		t = t.Add(time.Minute)
+	}
+
+	return nil
+}
+
+// parseCronField parses a single cron field and returns a set of valid values.
+// Supports: * (all), */N (step), N (single), N-M (range), N,M,O (list)
+func parseCronField(field string, min, max int) map[int]bool {
+	result := make(map[int]bool)
+
+	for _, part := range strings.Split(field, ",") {
+		part = strings.TrimSpace(part)
+
+		// */N - step
+		if strings.HasPrefix(part, "*/") {
+			step, err := strconv.Atoi(part[2:])
+			if err != nil || step <= 0 {
+				return nil
+			}
+			for i := min; i <= max; i += step {
+				result[i] = true
+			}
+			continue
+		}
+
+		// * - all
+		if part == "*" {
+			for i := min; i <= max; i++ {
+				result[i] = true
+			}
+			continue
+		}
+
+		// N-M - range
+		if strings.Contains(part, "-") {
+			bounds := strings.SplitN(part, "-", 2)
+			lo, err1 := strconv.Atoi(bounds[0])
+			hi, err2 := strconv.Atoi(bounds[1])
+			if err1 != nil || err2 != nil || lo > hi {
+				return nil
+			}
+			for i := lo; i <= hi; i++ {
+				result[i] = true
+			}
+			continue
+		}
+
+		// N - single value
+		val, err := strconv.Atoi(part)
+		if err != nil {
+			return nil
+		}
+		result[val] = true
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func (cs *CronService) recomputeNextRuns() {
@@ -254,7 +398,17 @@ func (cs *CronService) saveStore() error {
 		return err
 	}
 
-	return os.WriteFile(cs.storePath, data, 0644)
+	if err := os.WriteFile(cs.storePath, data, 0644); err != nil {
+		return err
+	}
+
+	// Track file stats after our own write so we can detect external changes
+	if info, err := os.Stat(cs.storePath); err == nil {
+		cs.lastModTime = info.ModTime()
+		cs.lastFileSize = info.Size()
+	}
+
+	return nil
 }
 
 func (cs *CronService) AddJob(name string, schedule CronSchedule, message string, deliver bool, channel, to string) (*CronJob, error) {

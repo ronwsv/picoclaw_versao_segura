@@ -91,7 +91,7 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) (st
 	cmdCtx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, "sh", "-c", command)
+	cmd := exec.CommandContext(cmdCtx, "bash", "-c", command)
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
